@@ -48,25 +48,6 @@ fn main() {
     env_logger::init();
 
     let args = Args::parse();
-    let all_available_examples = list_all_examples().unwrap();
-    let languages = args.languages.unwrap_or_else(|| vec!["rs".to_string()]);
-
-    let example_paths = all_available_examples
-        .iter()
-        .filter_map(|example_path| {
-            let name = example_path.file_name()?.to_string_lossy();
-            if args.examples.is_empty()
-                || args
-                    .examples
-                    .iter()
-                    .any(|name_substring| name.contains(name_substring))
-            {
-                Some(example_path.clone())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
 
     let http_client = Arc::new(ReqwestClient::new());
     let app = Application::headless().with_http_client(http_client.clone());
@@ -75,11 +56,9 @@ fn main() {
         let app_state = init(cx);
 
         let model = find_model("claude-3-7-sonnet-latest", cx).unwrap();
-
         LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
             registry.set_default_model(Some(model.clone()), cx);
         });
-
         let model_provider_id = model.provider_id();
 
         let authenticate = authenticate_model_provider(model_provider_id.clone(), cx);
@@ -89,121 +68,13 @@ fn main() {
 
             std::fs::create_dir_all(REPOS_DIR)?;
             std::fs::create_dir_all(WORKTREES_DIR)?;
+            let run_dir = create_run_dir()?;
 
-            let run_dir = Path::new(RUNS_DIR).join(format!(
-                "{}",
-                chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
-            ));
-            std::fs::create_dir_all(&run_dir)?;
+            let mut loaded_examples = load_examples(args.examples, args.languages, &run_dir)?;
+            setup_examples(&mut loaded_examples, cx).await?;
 
-            let mut examples = Vec::new();
-
-            const COLORS: [&str; 12] = [
-                "\x1b[31m", // Red
-                "\x1b[32m", // Green
-                "\x1b[33m", // Yellow
-                "\x1b[34m", // Blue
-                "\x1b[35m", // Magenta
-                "\x1b[36m", // Cyan
-                "\x1b[91m", // Bright Red
-                "\x1b[92m", // Bright Green
-                "\x1b[93m", // Bright Yellow
-                "\x1b[94m", // Bright Blue
-                "\x1b[95m", // Bright Magenta
-                "\x1b[96m", // Bright Cyan
-            ];
-
-            let mut max_name_width = 0;
-            let mut skipped = Vec::new();
-
-            for example_path in &example_paths {
-                let example = Example::load_from_directory(example_path, &run_dir)?;
-
-                if !example
-                    .base
-                    .language_extension
-                    .as_ref()
-                    .map_or(false, |lang| languages.contains(lang))
-                {
-                    skipped.push(example.name);
-                    continue;
-                }
-
-                let name_len = example.name.len();
-                if name_len > max_name_width {
-                    max_name_width = example.name.len();
-                }
-
-                examples.push(example);
-            }
-
-            println!("Skipped examples: {}\n", skipped.join(", "));
-
-            if examples.is_empty() {
-                eprintln!("Filter matched no examples");
-                return cx.update(|cx| cx.quit());
-            }
-
-            let mut repo_urls = HashSet::new();
-            let mut clone_tasks = Vec::new();
-
-            for (i, example) in examples.iter_mut().enumerate() {
-                let color = COLORS[i % COLORS.len()].to_string();
-                example.set_log_prefix_style(&color, max_name_width);
-
-                println!(
-                    "{}Logging to: {}",
-                    example.log_prefix,
-                    example.output_file_path.display()
-                );
-
-                let repo_url = example.base.url.clone();
-                if repo_urls.insert(repo_url.clone()) {
-                    let repo_path = repo_path_for_url(&repo_url);
-
-                    if !repo_path.join(".git").is_dir() {
-                        println!(
-                            "{:<width$}  < {}",
-                            "↓ Cloning",
-                            repo_url,
-                            width = max_name_width
-                        );
-
-                        let git_task = cx.spawn(async move |_cx| {
-                            std::fs::create_dir_all(&repo_path)?;
-                            run_git(&repo_path, &["init"]).await?;
-                            run_git(&repo_path, &["remote", "add", "origin", &repo_url]).await
-                        });
-
-                        clone_tasks.push(git_task);
-                    } else {
-                        println!(
-                            "{:<width$}  < {}",
-                            "✔︎ Already cloned",
-                            repo_url,
-                            width = max_name_width
-                        );
-
-                        let actual_origin =
-                            run_git(&repo_path, &["remote", "get-url", "origin"]).await?;
-                        if actual_origin != repo_url {
-                            return Err(anyhow!(
-                                "remote origin {} does not match expected origin {}",
-                                actual_origin,
-                                repo_url,
-                            ));
-                        }
-                    }
-                }
-            }
-
-            future::join_all(clone_tasks).await;
-
-            for example in examples.iter() {
-                example.setup().await?;
-            }
-
-            let tasks = examples
+            let tasks = loaded_examples
+                .examples
                 .into_iter()
                 .map(|example| {
                     let app_state = app_state.clone();
@@ -214,52 +85,170 @@ fn main() {
                 })
                 .collect::<Vec<_>>();
 
-            let results: Vec<(Result<JudgeOutput>, Example)> = future::join_all(tasks).await;
-
-            println!("\n\n");
-            println!("========================================");
-            println!("              EVAL RESULTS              ");
-            println!("========================================");
-            println!("");
-
-            let mut judge_scores = Vec::new();
-
-            for (result, example) in results {
-                match result {
-                    Err(err) => {
-                        println!("💥 {}{:?}", example.log_prefix, err);
-                    }
-                    Ok(judge_output) => {
-                        const SCORES: [&str; 6] = ["💀", "😭", "😔", "😐", "🙂", "🤩"];
-
-                        println!(
-                            "{} {}{}",
-                            SCORES[judge_output.score.min(5) as usize],
-                            example.log_prefix,
-                            judge_output.score,
-                        );
-                        judge_scores.push(judge_output.score);
-                    }
-                }
-                println!(
-                    "{}    > {}",
-                    " ".repeat(max_name_width),
-                    example.output_file_path.display()
-                );
-            }
-
-            let score_count = judge_scores.len();
-            let average_score = judge_scores
-                .into_iter()
-                .map(|score| score as f32)
-                .sum::<f32>()
-                / (score_count as f32);
-            println!("\nAverage score: {average_score}");
+            let results = future::join_all(tasks).await;
+            print_results(results, loaded_examples.max_name_width);
 
             cx.update(|cx| cx.quit())
         })
         .detach_and_log_err(cx);
     });
+}
+
+fn create_run_dir() -> Result<PathBuf> {
+    let run_dir = Path::new(RUNS_DIR).join(format!(
+        "{}",
+        chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
+    ));
+    std::fs::create_dir_all(&run_dir)?;
+    Ok(run_dir)
+}
+
+struct LoadedExamples {
+    examples: Vec<Example>,
+    max_name_width: usize,
+}
+
+fn load_examples(
+    example_names: Vec<String>,
+    languages: Option<Vec<String>>,
+    run_dir: &Path,
+) -> Result<LoadedExamples> {
+    let mut examples = Vec::new();
+    let mut skipped = Vec::new();
+    let mut max_name_width = 0;
+
+    let languages = languages.unwrap_or_else(|| vec!["rs".to_string()]);
+
+    for example_path in list_all_examples() {
+        let example = Example::load_from_directory(&example_path, &run_dir)?;
+
+        let matches_name = example_names.is_empty()
+            || example_names
+                .iter()
+                .any(|name_substring| example.name.contains(name_substring));
+
+        let matches_extension = example
+            .base
+            .language_extension
+            .as_ref()
+            .map_or(false, |lang| languages.contains(lang));
+
+        if !matches_name || !matches_extension {
+            skipped.push(example.name);
+            continue;
+        }
+
+        let name_len = example.name.len();
+        if name_len > max_name_width {
+            max_name_width = example.name.len();
+        }
+
+        examples.push(example);
+    }
+
+    println!("Skipped examples: {}\n", skipped.join(", "));
+
+    if examples.is_empty() {
+        return Err(anyhow!("Filter matched no examples"));
+    }
+
+    Ok(LoadedExamples {
+        examples,
+        max_name_width,
+    })
+}
+
+fn list_all_examples() -> impl Iterator<Item = PathBuf> {
+    let path = std::fs::canonicalize(EXAMPLES_DIR).unwrap();
+    let entries = std::fs::read_dir(path).unwrap();
+
+    entries.filter_map(|entry| {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        if path.is_dir() { Some(path) } else { None }
+    })
+}
+
+const EXAMPLE_COLORS: [&str; 12] = [
+    "\x1b[31m", // Red
+    "\x1b[32m", // Green
+    "\x1b[33m", // Yellow
+    "\x1b[34m", // Blue
+    "\x1b[35m", // Magenta
+    "\x1b[36m", // Cyan
+    "\x1b[91m", // Bright Red
+    "\x1b[92m", // Bright Green
+    "\x1b[93m", // Bright Yellow
+    "\x1b[94m", // Bright Blue
+    "\x1b[95m", // Bright Magenta
+    "\x1b[96m", // Bright Cyan
+];
+
+async fn setup_examples(examples: &mut LoadedExamples, cx: &mut AsyncApp) -> Result<()> {
+    let LoadedExamples {
+        examples,
+        max_name_width,
+    } = examples;
+
+    let mut repo_urls = HashSet::new();
+    let mut clone_tasks = Vec::new();
+
+    for (i, example) in examples.iter_mut().enumerate() {
+        let color = EXAMPLE_COLORS[i % EXAMPLE_COLORS.len()].to_string();
+        example.set_log_prefix_style(&color, *max_name_width);
+
+        println!(
+            "{}Logging to: {}",
+            example.log_prefix,
+            example.output_file_path.display()
+        );
+
+        let repo_url = example.base.url.clone();
+        if repo_urls.insert(repo_url.clone()) {
+            let repo_path = repo_path_for_url(&repo_url);
+
+            if !repo_path.join(".git").is_dir() {
+                println!(
+                    "{:<width$}  < {}",
+                    "↓ Cloning",
+                    repo_url,
+                    width = max_name_width
+                );
+
+                let git_task = cx.spawn(async move |_cx| {
+                    std::fs::create_dir_all(&repo_path)?;
+                    run_git(&repo_path, &["init"]).await?;
+                    run_git(&repo_path, &["remote", "add", "origin", &repo_url]).await
+                });
+
+                clone_tasks.push(git_task);
+            } else {
+                println!(
+                    "{:<width$}  < {}",
+                    "✔︎ Already cloned",
+                    repo_url,
+                    width = max_name_width
+                );
+
+                let actual_origin = run_git(&repo_path, &["remote", "get-url", "origin"]).await?;
+                if actual_origin != repo_url {
+                    return Err(anyhow!(
+                        "remote origin {} does not match expected origin {}",
+                        actual_origin,
+                        repo_url,
+                    ));
+                }
+            }
+        }
+    }
+
+    future::join_all(clone_tasks).await;
+
+    for example in examples.iter() {
+        example.setup().await?;
+    }
+
+    Ok(())
 }
 
 async fn run_example(
@@ -274,18 +263,46 @@ async fn run_example(
     example.judge(model, diff, cx).await
 }
 
-fn list_all_examples() -> Result<Vec<PathBuf>> {
-    let path = std::fs::canonicalize(EXAMPLES_DIR).unwrap();
-    let entries = std::fs::read_dir(path).unwrap();
-    let mut result_paths = Vec::new();
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        if path.is_dir() {
-            result_paths.push(path);
+fn print_results(results: Vec<(Result<JudgeOutput>, Example)>, max_name_width: usize) {
+    println!("\n\n");
+    println!("========================================");
+    println!("              EVAL RESULTS              ");
+    println!("========================================");
+    println!("");
+
+    let mut judge_scores = Vec::new();
+
+    for (result, example) in results {
+        match result {
+            Err(err) => {
+                println!("💥 {}{:?}", example.log_prefix, err);
+            }
+            Ok(judge_output) => {
+                const SCORES: [&str; 6] = ["💀", "😭", "😔", "😐", "🙂", "🤩"];
+
+                println!(
+                    "{} {}{}",
+                    SCORES[judge_output.score.min(5) as usize],
+                    example.log_prefix,
+                    judge_output.score,
+                );
+                judge_scores.push(judge_output.score);
+            }
         }
+        println!(
+            "{}    > {}",
+            " ".repeat(max_name_width),
+            example.output_file_path.display()
+        );
     }
-    Ok(result_paths)
+
+    let score_count = judge_scores.len();
+    let average_score = judge_scores
+        .into_iter()
+        .map(|score| score as f32)
+        .sum::<f32>()
+        / (score_count as f32);
+    println!("\nAverage score: {average_score}");
 }
 
 /// Subset of `workspace::AppState` needed by `HeadlessAssistant`, with additional fields.
